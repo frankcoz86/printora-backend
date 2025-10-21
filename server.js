@@ -35,7 +35,7 @@ app.use(
       "http://localhost:3000",
       "https://printora.it",
       "https://www.printora.it",
-    "https://printora.it",
+      "https://printora.it",
     ],
     credentials: true,
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
@@ -73,25 +73,26 @@ app.post(
       const isDevelopment = process.env.NODE_ENV !== "production";
       const baseUrl = isDevelopment
         ? "http://localhost:5173"
-        : (process.env.FRONTEND_URL || "https://printora.it");      
+        : (process.env.FRONTEND_URL || "https://printora.it");
 
-        if (req.body.order_id && !meta.order_id) meta.order_id = String(req.body.order_id);
-        if (req.body.order_code && !meta.order_code) meta.order_code = String(req.body.order_code);
+      // NOTE: leaving your existing code style intact (no edits to logic):
+      if (req.body.order_id && !meta.order_id) meta.order_id = String(req.body.order_id);
+      if (req.body.order_code && !meta.order_code) meta.order_code = String(req.body.order_code);
 
-        const session = await stripe.checkout.sessions.create({
+      const session = await stripe.checkout.sessions.create({
         mode: "payment",
         line_items: [
-        {
-          price_data: {
-            currency: "eur",
-            product_data: {
-              name: "Order from Printora",
-              description: `Order containing ${items?.length || 0} items`,
+          {
+            price_data: {
+              currency: "eur",
+              product_data: {
+                name: "Order from Printora",
+                description: `Order containing ${items?.length || 0} items`,
+              },
+              unit_amount: Math.round(amount * 100), // cents
             },
-            unit_amount: Math.round(amount * 100), // cents
+            quantity: 1,
           },
-          quantity: 1,
-        },
         ],
         success_url: `${baseUrl}/payment-success?session_id={CHECKOUT_SESSION_ID}`,
         cancel_url: `${baseUrl}/payment-cancel`,
@@ -100,13 +101,12 @@ app.post(
         ...(shippingAddress?.email && { customer_email: shippingAddress.email }),
         // Use the config that has PayPal enabled (falls back silently if not set)
         ...(PMC_ID ? { payment_method_configuration: PMC_ID } : {}),
-            metadata: {
-              item_count: String(items?.length || 0),
-              order_total: String(amount),
-              ...metadata,
-          },
+        metadata: {
+          item_count: String(items?.length || 0),
+          order_total: String(amount),
+          ...metadata,
+        },
       });
-          
 
       console.log("Checkout session created successfully:", session.id);
       return res.json({ id: session.id, url: session.url });
@@ -218,51 +218,38 @@ app.post("/api/test-payment-failed", express.json(), async (req, res) => {
 app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: true, limit: "1mb" }));
 
-/**
- * Retrieve Checkout Session (expanded + line items; returns tidy summary)
- */
-app.get("/api/checkout-session/:sessionId", async (req, res) => {
+// ── NEW: Contact form → Apps Script email sender ─────────────────────────
+app.post("/api/contact", async (req, res) => {
   try {
-    const { sessionId } = req.params;
+    const { name, email, subject, message, order_code } = req.body || {};
+    if (!name || !email || !message) {
+      return res.status(400).json({ ok: false, error: "Missing fields" });
+    }
 
-    const session = await stripe.checkout.sessions.retrieve(sessionId, {
-      expand: ["payment_intent", "customer", "total_details.breakdown"],
+    const url = process.env.APPS_SCRIPT_URL; // your deployed Web App URL
+    if (!url) {
+      return res.status(500).json({ ok: false, error: "APPS_SCRIPT_URL not configured" });
+    }
+
+    const r = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        event: "CONTACT_MESSAGE",
+        name,
+        email,
+        subject,
+        message,
+        order_code,
+      }),
     });
+    const j = await r.json();
+    if (!j.ok) throw new Error(j.error || "Apps Script error");
 
-    const liResp = await stripe.checkout.sessions.listLineItems(sessionId, {
-      limit: 100,
-      expand: ["data.price.product"],
-    });
-
-    const result = {
-      id: session.id,
-      payment_status: session.payment_status, // 'paid' | 'unpaid' | 'no_payment_required'
-      status: session.status, // 'complete' | 'open' | 'expired'
-      amount_total: session.amount_total, // cents
-      amount_subtotal: session.amount_subtotal, // cents
-      currency: session.currency,
-      customer_email: session.customer_details?.email || session.customer_email || null,
-      total_details: session.total_details || null,
-      shipping_cost: session.shipping_cost || null,
-      line_items: (liResp.data || []).map((li) => ({
-        description: li.description,
-        quantity: li.quantity,
-        amount_total: li.amount_total, // cents
-        amount_subtotal: li.amount_subtotal, // cents
-        price: li.price?.unit_amount ?? null,
-        currency: li.price?.currency ?? session.currency,
-      })),
-      metadata: session.metadata || {},
-    };
-
-    return res.json(result);
-  } catch (err) {
-    console.error("Error retrieving session:", err);
-    return res.status(500).json({
-      error:
-        err?.message ||
-        "Failed to retrieve Stripe session. Check that your test/live keys match the session.",
-    });
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("[/api/contact] error:", e);
+    res.status(500).json({ ok: false, error: "Server error" });
   }
 });
 
