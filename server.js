@@ -3,13 +3,14 @@ import "dotenv/config";
 import express from "express";
 import Stripe from "stripe";
 import cors from "cors";
+import http from "http";
 
 import filesRouter from "./routes/files.js";
 import hooksRouter from "./routes/hooks.js"; // <-- NEW
 
 // Helper to notify your Apps Script on failures
 async function notifyAppsScriptPaymentFailed(payload) {
-  const url = process.env.APPS_SCRIPT_URL; // e.g. your deployed Web App URL
+  const url = process.env.APPS_SCRIPT_URL;
   if (!url) return;
   try {
     await fetch(url, {
@@ -25,25 +26,41 @@ async function notifyAppsScriptPaymentFailed(payload) {
 const app = express();
 
 /**
- * CORS
- * Add your production domain(s) to the origin array.
+ * CORS (put this first)
+ * - Add your production domain(s) to origin
+ * - Add a long maxAge so preflights are cached by the browser
  */
-app.use(
-  cors({
-    origin: [
-      "http://localhost:5173",
-      "http://localhost:3000",
-      "https://printora.it",
-      "https://www.printora.it",
-      "https://printora.it",
-    ],
-    credentials: true,
-    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    // include X-Relay-Token so browser can send it if needed (Make filter reads it from the relay)
-    allowedHeaders: ["Content-Type", "Authorization", "Accept", "X-Relay-Token"],
-  })
-);
-app.options("*", cors()); // Preflight for all routes
+const corsOptions = {
+  origin: [
+    "http://localhost:5173",
+    "http://localhost:3000",
+    "https://printora.it",
+    "https://www.printora.it",
+  ],
+  credentials: true,
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization", "Accept", "X-Relay-Token"],
+  maxAge: 86400, // cache preflight for 24h
+};
+app.use(cors(corsOptions));
+
+/**
+ * ⚡ FAST PATH for upload preflight:
+ * Short-circuit OPTIONS on the upload route so it never touches other middleware.
+ */
+app.options("/api/files/upload", (req, res) => {
+  res.set({
+    "Access-Control-Allow-Origin": req.headers.origin || "https://www.printora.it",
+    "Access-Control-Allow-Credentials": "true",
+    "Access-Control-Allow-Methods": "GET,POST,PUT,DELETE,OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization, Accept, X-Relay-Token",
+    "Access-Control-Max-Age": "86400",
+  });
+  return res.status(204).end();
+});
+
+// Safety: still allow generic preflight for any other route
+app.options("*", cors(corsOptions));
 
 /**
  * Stripe init
@@ -56,8 +73,10 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
   apiVersion: "2024-06-20",
 });
 const PMC_ID = process.env.STRIPE_PMC_ID;
+
 /**
  * Route-scoped parser BEFORE global parsers for Stripe Checkout creation
+ * (your original ordering preserved)
  */
 app.post(
   "/api/create-checkout-session",
@@ -99,7 +118,6 @@ app.post(
         locale: "auto",
         billing_address_collection: "auto",
         ...(shippingAddress?.email && { customer_email: shippingAddress.email }),
-        // Use the config that has PayPal enabled (falls back silently if not set)
         ...(PMC_ID ? { payment_method_configuration: PMC_ID } : {}),
         metadata: {
           item_count: String(items?.length || 0),
@@ -127,14 +145,13 @@ app.post(
   express.raw({ type: "application/json" }),
   async (req, res) => {
     const sig = req.headers["stripe-signature"];
-    const whSecret = process.env.STRIPE_WEBHOOK_SECRET; // from your Stripe Dashboard
+    const whSecret = process.env.STRIPE_WEBHOOK_SECRET;
 
     let event;
     try {
       if (whSecret) {
         event = stripe.webhooks.constructEvent(req.body, sig, whSecret);
       } else {
-        // If you don't set a secret (not recommended), accept as-is
         event = JSON.parse(req.body.toString("utf8"));
       }
     } catch (err) {
@@ -213,53 +230,19 @@ app.post("/api/test-payment-failed", express.json(), async (req, res) => {
 });
 
 /**
+ * 🚀 IMPORTANT: Mount the files router BEFORE global JSON/urlencoded parsers.
+ * If filesRouter uses multer/busboy, this prevents body parsing overhead on big multipart uploads.
+ */
+app.use("/api/files", filesRouter);
+
+/**
  * Global parsers for the rest of the routes
  */
 app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: true, limit: "1mb" }));
 
-// ── NEW: Contact form → Apps Script email sender ─────────────────────────
-app.post("/api/contact", async (req, res) => {
-  try {
-    const { name, email, subject, message, order_code } = req.body || {};
-    if (!name || !email || !message) {
-      return res.status(400).json({ ok: false, error: "Missing fields" });
-    }
-
-    const url = process.env.APPS_SCRIPT_URL; // your deployed Web App URL
-    if (!url) {
-      return res.status(500).json({ ok: false, error: "APPS_SCRIPT_URL not configured" });
-    }
-
-    const r = await fetch(url, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        event: "CONTACT_MESSAGE",
-        name,
-        email,
-        subject,
-        message,
-        order_code,
-      }),
-    });
-    const j = await r.json();
-    if (!j.ok) throw new Error(j.error || "Apps Script error");
-
-    res.json({ ok: true });
-  } catch (e) {
-    console.error("[/api/contact] error:", e);
-    res.status(500).json({ ok: false, error: "Server error" });
-  }
-});
-
 /**
- * Files API
- */
-app.use("/api/files", filesRouter);
-
-/**
- * Hooks relay API  <-- NEW
+ * Hooks relay API
  */
 app.use("/api/hooks", hooksRouter);
 
@@ -283,7 +266,16 @@ app.get("/api/health", (req, res) => {
 });
 
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
+
+// Create an HTTP server to tune timeouts (helps with larger uploads)
+const server = http.createServer(app);
+
+// Keep connections open long enough for cloud uploads
+server.keepAliveTimeout = 65_000;  // > default 5s/15s on some hosts
+server.headersTimeout   = 66_000;
+server.requestTimeout   = 0;       // disable per-request timeout
+
+server.listen(PORT, () => {
   console.log(`🚀 Backend running on http://localhost:${PORT}`);
   console.log(`📝 Stripe API Version: 2024-06-20`);
   console.log(
