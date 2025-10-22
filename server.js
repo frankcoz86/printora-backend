@@ -6,7 +6,8 @@ import cors from "cors";
 import http from "http";
 
 import filesRouter from "./routes/files.js";
-import hooksRouter from "./routes/hooks.js"; // <-- NEW
+import hooksRouter from "./routes/hooks.js"; // <-- existing
+import contactRouter from "./routes/contact.js"; // <-- NEW
 
 // Helper to notify your Apps Script on failures
 async function notifyAppsScriptPaymentFailed(payload) {
@@ -245,6 +246,14 @@ app.use(express.urlencoded({ extended: true, limit: "1mb" }));
  * Hooks relay API
  */
 app.use("/api/hooks", hooksRouter);
+
+/**
+ * ✅ Contact API (NEW)
+ *   - This is the JSON route your frontend calls: POST /api/contact
+ *   - contactRouter handles GET ping, OPTIONS, and POST forwarding to Apps Script
+ */
+app.use("/api/contact", contactRouter);
+console.log("[BOOT] contact router mounted at /api/contact");
 
 /**
  * Health Check
